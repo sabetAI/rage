@@ -23,14 +23,14 @@ argparser = ArgumentParser()
 argparser.add_argument("input")
 argparser.add_argument("output")
 argparser.add_argument("--eval", action="store_true")
-argparser.add_argument("--lr", type=float, default=1e-4)
-argparser.add_argument("--adam_eps", type=float, default=1e-8)
-argparser.add_argument("--batch_size", type=int, default=48)
-argparser.add_argument("--warm_steps", type=int, default=0)
+# argparser.add_argument("--lr", type=float, default=1e-4)
+# argparser.add_argument("--adam_eps", type=float, default=1e-8)
+# argparser.add_argument("--batch_size", type=int, default=48)
+# argparser.add_argument("--warm_steps", type=int, default=0)
 argparser.add_argument("--num_epochs", type=int, default=2)
 argparser.add_argument("--num_workers", type=int, default=0)
 argparser.add_argument("--local_rank", type=int, default=0)
-argparser.add_argument("--weight", type=float, default=4.0)
+# argparser.add_argument("--weight", type=float, default=4.0)
 argparser.add_argument("--seed", type=int, default=0)
 argparser.add_argument("--device", type=int, default=0)
 argparser.add_argument("--deepspeed", action="store_true")
@@ -199,24 +199,26 @@ if __name__ == "__main__":
     deepspeed_args = json.load(open(args.deepspeed_config))
     args.__dict__.update(deepspeed_args)
     tokenizer = RagTokenizer.from_pretrained("facebook/rag-sequence-base")
+    trainset = RAGDataset(args, tokenizer)
     retriever = RagRetriever.from_pretrained("facebook/rag-sequence-base")
     model = RagTokenForGeneration.from_pretrained(
         "facebook/rag-sequence-base", retriever=retriever
     )
     model_engine, optimizer, _, _ = deepspeed.initialize(
-        args=args, model=model, model_parameters=model.parameters()
+        args=args,
+        model=model,
+        model_parameters=model.parameters(),
     )
 
-    dataset = RAGDataset(args, tokenizer)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
+    trainloader = DataLoader(
+        trainset,
+        batch_size=args.train_micro_batch_size_per_gpu,
         num_workers=args.num_workers,
         shuffle=True,
-        collate_fn=dataset.collate,
+        collate_fn=trainset.collate,
     )
 
     if args.eval:
-        evaluate(model_engine, dataloader, args)
+        evaluate(model_engine, trainloader, args)
     else:
-        train(model_engine, optimizer, dataloader, args)
+        train(model_engine, optimizer, trainloader, args)
