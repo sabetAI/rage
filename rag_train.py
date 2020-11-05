@@ -148,14 +148,14 @@ def train(model_engine, optimizer, dataloader, args):
     model_engine.train()
     model_engine = model_engine.to(args.device)
     # optimizer = get_optimizer(model, args)
-    lr_scheduler = get_scheduler(dataloader, optimizer, args)
+    # lr_scheduler = get_scheduler(dataloader, optimizer, args)
     printer = Printer(interval=10)
 
     for epoch in range(args.num_epochs):
         for batch_input in tqdm(dataloader):
             # optimizer.zero_grad()
-            # batch_dict = {k: v.to(args.device) for k, v in batch_input.items()}
-            output = model_engine(**batch_input)
+            batch_dict = {k: v.to(args.device) for k, v in batch_input.items()}
+            output = model_engine(**batch_dict)
             loss = output.loss.mean()
             print(loss.item())
             wandb.log({"epoch": epoch, "loss": loss.item()})
