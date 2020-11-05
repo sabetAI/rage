@@ -5,6 +5,8 @@ from transformers import (
     AdamW,
     get_linear_schedule_with_warmup,
 )
+import deepspeed
+
 from torch.utils.data import DataLoader, Dataset
 from torch.nn.utils.rnn import pad_sequence
 from argparse import ArgumentParser
@@ -14,9 +16,8 @@ import torch
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss
 import difflib
 
+import json
 import wandb
-import deepspeed
-
 
 argparser = ArgumentParser()
 argparser.add_argument("input")
@@ -28,12 +29,15 @@ argparser.add_argument("--batch_size", type=int, default=48)
 argparser.add_argument("--warm_steps", type=int, default=0)
 argparser.add_argument("--num_epochs", type=int, default=2)
 argparser.add_argument("--num_workers", type=int, default=0)
+argparser.add_argument("--local_rank", type=int, default=0)
 argparser.add_argument("--weight", type=float, default=4.0)
 argparser.add_argument("--seed", type=int, default=0)
 argparser.add_argument("--device", type=int, default=0)
+argparser.add_argument("--deepspeed", action="store_true")
+argparser.add_argument("--deepspeed_config", type=str, default="ds_config.json")
+
 
 args = argparser.parse_args()
-
 torch.manual_seed(args.seed)
 
 wandb.init(config=args, project="ctrl-cls")
@@ -155,14 +159,16 @@ def train(model_engine, optimizer, dataloader, args):
             loss = output.loss.mean()
             print(loss.item())
             wandb.log({"epoch": epoch, "loss": loss.item()})
-            loss.backward()
-            optimizer.step()
-            lr_scheduler.step()
+            # loss.backward()
+            model_engine.backward(loss)
+            # optimizer.step()
+            model_engine.step()
+            # lr_scheduler.step()
         checkpt = f"{args.output}-checkpoint{epoch}"
         model_engine.save_pretrained(checkpt)
 
 
-def evaluate(model_engine, dataloader, args):
+def evaluate(model, dataloader, args):
     fout = open(args.output, "w", encoding="utf8")
     model.eval()
     model = model.to(args.device)
@@ -190,20 +196,15 @@ def evaluate(model_engine, dataloader, args):
 
 
 if __name__ == "__main__":
-    deepspeed_config = {
-        "train_batch_size": 100,
-        "gradient_accumulation_steps": 2,
-        "optimizer": {"type": "Adam", "params": {"lr": 0.00015}},
-        "fp16": {"enabled": True},
-        "zero_optimization": True,
-    }
+    deepspeed_args = json.load(open(args.deepspeed_config))
+    args.__dict__.update(deepspeed_args)
     tokenizer = RagTokenizer.from_pretrained("facebook/rag-sequence-base")
     retriever = RagRetriever.from_pretrained("facebook/rag-sequence-base")
     model = RagTokenForGeneration.from_pretrained(
         "facebook/rag-sequence-base", retriever=retriever
     )
     model_engine, optimizer, _, _ = deepspeed.initialize(
-        args=deepspeed_config, model=model, model_parameters=model.parametes()
+        args=args, model=model, model_parameters=model.parameters()
     )
 
     dataset = RAGDataset(args, tokenizer)
