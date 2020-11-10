@@ -5,7 +5,6 @@ from transformers import (
     AdamW,
     get_linear_schedule_with_warmup,
 )
-import deepspeed
 
 from torch.utils.data import DataLoader, Dataset
 from torch.nn.utils.rnn import pad_sequence
@@ -16,79 +15,123 @@ import torch
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss
 import difflib
 
+import os
 import json
+
+from typing_extensions import Literal
 import wandb
+
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
 
 argparser = ArgumentParser()
 argparser.add_argument("input")
 argparser.add_argument("output")
 argparser.add_argument("--eval", action="store_true")
-# argparser.add_argument("--lr", type=float, default=1e-4)
-# argparser.add_argument("--adam_eps", type=float, default=1e-8)
-# argparser.add_argument("--batch_size", type=int, default=48)
-# argparser.add_argument("--warm_steps", type=int, default=0)
+argparser.add_argument("--lr", type=float, default=1e-4)
+argparser.add_argument("--adam_eps", type=float, default=1e-8)
+argparser.add_argument("--batch_size", type=int, default=48)
+argparser.add_argument("--warm_steps", type=int, default=0)
+argparser.add_argument("--weight_decay", type=int, default=0)
 argparser.add_argument("--num_epochs", type=int, default=2)
 argparser.add_argument("--num_workers", type=int, default=0)
 argparser.add_argument("--local_rank", type=int, default=0)
 # argparser.add_argument("--weight", type=float, default=4.0)
 argparser.add_argument("--seed", type=int, default=0)
 argparser.add_argument("--device", type=int, default=0)
-argparser.add_argument("--deepspeed", action="store_true")
-argparser.add_argument("--deepspeed_config", type=str, default="ds_config.json")
 
 
 args = argparser.parse_args()
 torch.manual_seed(args.seed)
 
-wandb.init(config=args, project="ctrl-cls")
-wandb.config["more"] = "nothing"
+# wandb.init(config=args, project="ctrl-cls")
+# wandb.config["more"] = "nothing"
 
 
-class RAGDataset(Dataset):
+class LitRage(pl.LightningModule):
+    def __init__(self, args, trainset, model):
+        super().__init__()
+        self.hparams.weight_decay = args.weight_decay
+        self.hparams.learning_rate = args.lr
+        self.hparams.adam_epsilon = args.adam_eps
+        self.hparams.warmup_steps = args.warm_steps
+        self.model = model
+        self.total_steps = len(trainset)
+        self.args = args
+
+    def training_step(self, batch, batch_idx):
+        output = self.model(**batch)
+        loss = output.loss.mean()
+        self.log("train_loss", loss)
+        return loss
+
+    def configure_optimizers(self):
+        "Prepare optimizer and schedule (linear warmup and decay)"
+        no_decay = ["bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [
+                    p
+                    for n, p in self.model.named_parameters()
+                    if not any(nd in n for nd in no_decay)
+                ],
+                "weight_decay": self.hparams.weight_decay,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in self.model.named_parameters()
+                    if any(nd in n for nd in no_decay)
+                ],
+                "weight_decay": 0.0,
+            },
+        ]
+        optimizer = AdamW(
+            optimizer_grouped_parameters,
+            lr=self.hparams.learning_rate,
+            eps=self.hparams.adam_epsilon,
+        )
+
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=self.hparams.warmup_steps,
+            num_training_steps=self.total_steps,
+        )
+        scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
+        return [optimizer], [scheduler]
+
+    # def train_dataloader(self):
+    #     return DataLoader(self.dataset["train"], batch_size=self.train_batch_size)
+
+
+class RAGEDataset(Dataset):
     def __init__(self, args, tokenizer):
         super().__init__()
-        if args.eval:
-            corpus = [
-                l.strip() for l in open(args.input, encoding="utf8").read().splitlines()
-            ]
-        else:
-            corpus = [
-                l.strip() for l in open(args.input, encoding="utf8").read().splitlines()
-            ]
+        corpus = [
+            l.strip() for l in open(args.input, encoding="utf8").read().splitlines()
+        ]
         self.examples = corpus
         self.tokenizer = tokenizer
-        self.eval = args.eval
-        self.args = args
 
     def __len__(self):
         return len(self.examples)
 
     def __getitem__(self, item):
-        if self.eval:
-            text = self.examples[item]
-            return text
-        else:
-            src, trg = self.examples[item].split("\t")
-            return src, trg
+        src, trg = self.examples[item].split("\t")
+        return src, trg
 
     def collate(self, batch):
-        if self.eval:
-            input_ids = tokenizer(
-                batch, padding=True, truncation=True, return_tensors="pt"
-            )
-            return input_ids
-        else:
-            src_sentences = [src for src, _ in batch]
-            trg_sentences = [trg for _, trg in batch]
-            input_dict = tokenizer.prepare_seq2seq_batch(
-                src_sentences,
-                trg_sentences,
-                padding=True,
-                truncation=True,
-                return_tensors="pt",
-            )
+        src_sentences = [src for src, _ in batch]
+        trg_sentences = [trg for _, trg in batch]
+        input_dict = tokenizer.prepare_seq2seq_batch(
+            src_sentences,
+            trg_sentences,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+        )
 
-            return input_dict
+        return input_dict
 
 
 def get_optimizer(model, args):
@@ -111,61 +154,9 @@ def get_optimizer(model, args):
             "weight_decay": 0.0,
         },
     ]
-    optimizer = AdamW(
-        optimizer_grouped_parameters,
-        lr=args.lr,
-        eps=args.adam_eps,
-    )
+    optimizer = AdamW(optimizer_grouped_parameters, lr=args.lr, eps=args.adam_eps,)
 
     return optimizer
-
-
-def get_scheduler(dataloader, optimizer, args):
-    t_total = (
-        (len(dataloader.dataset) // (args.batch_size)) // 1 * float(args.num_epochs)
-    )
-    lr_scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=args.warm_steps,
-        num_training_steps=t_total,
-    )
-    return lr_scheduler
-
-
-class Printer:
-    def __init__(self, interval):
-        self.interval = interval
-        self.ctr = 0
-
-    def print(self, preds, labels):
-        if self.ctr % self.interval == 0:
-            print(labels[0])
-            print(preds[0])
-        self.ctr += 1
-
-
-def train(model_engine, optimizer, dataloader, args):
-    model_engine.train()
-    model_engine = model_engine.to(args.device)
-    # optimizer = get_optimizer(model, args)
-    # lr_scheduler = get_scheduler(dataloader, optimizer, args)
-    printer = Printer(interval=10)
-
-    for epoch in range(args.num_epochs):
-        for batch_input in tqdm(dataloader):
-            # optimizer.zero_grad()
-            batch_dict = {k: v.to(args.device) for k, v in batch_input.items()}
-            output = model_engine(**batch_dict)
-            loss = output.loss.mean()
-            print(loss.item())
-            wandb.log({"epoch": epoch, "loss": loss.item()})
-            # loss.backward()
-            model_engine.backward(loss)
-            # optimizer.step()
-            model_engine.step()
-            # lr_scheduler.step()
-        checkpt = f"{args.output}-checkpoint{epoch}"
-        model_engine.save_pretrained(checkpt)
 
 
 def evaluate(model, dataloader, args):
@@ -196,29 +187,40 @@ def evaluate(model, dataloader, args):
 
 
 if __name__ == "__main__":
-    deepspeed_args = json.load(open(args.deepspeed_config))
-    args.__dict__.update(deepspeed_args)
     tokenizer = RagTokenizer.from_pretrained("facebook/rag-sequence-base")
-    trainset = RAGDataset(args, tokenizer)
+    trainset = RAGEDataset(args, tokenizer)
     retriever = RagRetriever.from_pretrained("facebook/rag-sequence-base")
     model = RagTokenForGeneration.from_pretrained(
         "facebook/rag-sequence-base", retriever=retriever
     )
-    model_engine, optimizer, _, _ = deepspeed.initialize(
-        args=args,
-        model=model,
-        model_parameters=model.parameters(),
-    )
+
+    lit_rage = LitRage(args, trainset, model)
 
     trainloader = DataLoader(
         trainset,
-        batch_size=args.train_micro_batch_size_per_gpu,
+        batch_size=4,
         num_workers=args.num_workers,
         shuffle=True,
         collate_fn=trainset.collate,
     )
 
-    if args.eval:
-        evaluate(model_engine, trainloader, args)
-    else:
-        train(model_engine, optimizer, trainloader, args)
+    checkpoint = ModelCheckpoint(
+        filepath=os.path.join(
+            args.output, "{epoch:02d}-{global_step:02d}-{val_loss:.2f}"
+        ),
+        verbose=True,
+        save_top_k=-1,
+        period=-1,
+    )
+
+    trainer = pl.Trainer(
+        gpus=1,
+        num_nodes=1,
+        profiler=True,
+        max_epochs=10,
+        amp_level="O1",
+        precision=16,
+        checkpoint_callback=checkpoint,
+    )
+
+    trainer.fit(lit_rage, trainloader)
