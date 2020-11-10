@@ -117,12 +117,15 @@ class RAGEDataset(Dataset):
         return len(self.examples)
 
     def __getitem__(self, item):
-        src, trg = self.examples[item].split("\t")
-        return src, trg
+        try:
+            src, trg = self.examples[item].split("\t")
+            return src, trg
+        except:
+            return None, None
 
     def collate(self, batch):
-        src_sentences = [src for src, _ in batch]
-        trg_sentences = [trg for _, trg in batch]
+        src_sentences = [src for src, _ in batch if src is not None]
+        trg_sentences = [trg for _, trg in batch if trg is not None]
         input_dict = tokenizer.prepare_seq2seq_batch(
             src_sentences,
             trg_sentences,
