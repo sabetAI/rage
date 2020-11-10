@@ -28,15 +28,15 @@ argparser = ArgumentParser()
 argparser.add_argument("input")
 argparser.add_argument("output")
 argparser.add_argument("--eval", action="store_true")
+argparser.add_argument("--fp16", action="store_true")
 argparser.add_argument("--lr", type=float, default=1e-4)
 argparser.add_argument("--adam_eps", type=float, default=1e-8)
-argparser.add_argument("--batch_size", type=int, default=48)
+argparser.add_argument("--batch_size", type=int, default=4)
 argparser.add_argument("--warm_steps", type=int, default=0)
 argparser.add_argument("--weight_decay", type=int, default=0)
 argparser.add_argument("--num_epochs", type=int, default=2)
-argparser.add_argument("--num_workers", type=int, default=0)
+argparser.add_argument("--num_workers", type=int, default=4)
 argparser.add_argument("--local_rank", type=int, default=0)
-# argparser.add_argument("--weight", type=float, default=4.0)
 argparser.add_argument("--seed", type=int, default=0)
 argparser.add_argument("--device", type=int, default=0)
 
@@ -44,8 +44,9 @@ argparser.add_argument("--device", type=int, default=0)
 args = argparser.parse_args()
 torch.manual_seed(args.seed)
 
-# wandb.init(config=args, project="ctrl-cls")
-# wandb.config["more"] = "nothing"
+os.environ["WANDB_NOTEBOOK_NAME"] = "rage"
+wandb.init(config=args, project="rage")
+wandb.config["more"] = "nothing"
 
 
 class LitRage(pl.LightningModule):
@@ -137,31 +138,6 @@ class RAGEDataset(Dataset):
         return input_dict
 
 
-def get_optimizer(model, args):
-    no_decay = ["bias", "LayerNorm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [
-                p
-                for n, p in model.named_parameters()
-                if not any(nd in n for nd in no_decay)
-            ],
-            "weight_decay": 0.0,
-        },
-        {
-            "params": [
-                p
-                for n, p in model.named_parameters()
-                if any(nd in n for nd in no_decay)
-            ],
-            "weight_decay": 0.0,
-        },
-    ]
-    optimizer = AdamW(optimizer_grouped_parameters, lr=args.lr, eps=args.adam_eps,)
-
-    return optimizer
-
-
 def evaluate(model, dataloader, args):
     fout = open(args.output, "w", encoding="utf8")
     model.eval()
@@ -176,18 +152,6 @@ def evaluate(model, dataloader, args):
             argmax = [l[a == 1].softmax(1).max(1) for l, a in zip(logits, attention)]
             preds = [idx[val >= args.thresh] for val, idx in argmax]
 
-            for pred in preds:
-                if args.multi:
-                    output_tags = pred[pred != 0].tolist()
-                    errant_tags = [errant_map[o] for o in set(output_tags)]
-                    if len(errant_tags):
-                        output = ", ".join(errant_tags) + "\n"
-                    else:
-                        output = "noop\n"
-                else:
-                    output = errant_map[pred] + "\n"
-                fout.write(output)
-
 
 if __name__ == "__main__":
     tokenizer = RagTokenizer.from_pretrained("facebook/rag-sequence-base")
@@ -196,12 +160,11 @@ if __name__ == "__main__":
     model = RagTokenForGeneration.from_pretrained(
         "facebook/rag-sequence-base", retriever=retriever
     )
-
     lit_rage = LitRage(args, trainset, model)
 
     trainloader = DataLoader(
         trainset,
-        batch_size=4,
+        batch_size=args.batch_size,
         num_workers=args.num_workers,
         shuffle=True,
         collate_fn=trainset.collate,
@@ -222,7 +185,7 @@ if __name__ == "__main__":
         profiler=True,
         max_epochs=10,
         amp_level="O1",
-        precision=16,
+        precision=16 if args.fp16 else 32,
         checkpoint_callback=checkpoint,
     )
 
