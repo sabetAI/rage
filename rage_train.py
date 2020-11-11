@@ -187,6 +187,7 @@ if __name__ == "__main__":
         amp_level="O1",
         precision=16 if args.fp16 else 32,
         checkpoint_callback=checkpoint,
+        accumulate_grad_batches=16,
     )
 
     trainer.fit(lit_rage, trainloader)
